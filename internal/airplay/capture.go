@@ -890,18 +890,68 @@ func frameIntervalMillis(fps int) int {
 	return 1 + 999/fps
 }
 
-func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int, alwaysCopy bool) gstStage {
+const pipeWirePropertyProbeTimeout = 5 * time.Second
+
+// pipeWireAlwaysCopyProbe remembers a successful answer only, so a failed or
+// timed-out gst-inspect (for example during a registry rebuild) is retried
+// on the next capture instead of disabling always-copy for good.
+type pipeWireAlwaysCopyProbe struct {
+	mu        sync.Mutex
+	known     bool
+	supported bool
+	inspect   func(ctx context.Context) ([]byte, error)
+}
+
+func (p *pipeWireAlwaysCopyProbe) get() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.known {
+		return p.supported
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pipeWirePropertyProbeTimeout)
+	defer cancel()
+	out, err := p.inspect(ctx)
+	if err != nil {
+		return false
+	}
+	p.known = true
+	p.supported = bytes.Contains(out, []byte("always-copy"))
+	return p.supported
+}
+
+var defaultPipeWireAlwaysCopyProbe = &pipeWireAlwaysCopyProbe{
+	inspect: func(ctx context.Context) ([]byte, error) {
+		return exec.CommandContext(ctx, "gst-inspect-1.0", "pipewiresrc").Output()
+	},
+}
+
+// pipeWireSupportsAlwaysCopy reports whether the installed pipewiresrc has the
+// always-copy property (PipeWire 0.3.57 and newer). It is a variable so tests
+// can pin the answer without a GStreamer installation.
+var pipeWireSupportsAlwaysCopy = defaultPipeWireAlwaysCopyProbe.get
+
+// pipeWireVideoSourceStage builds the portal source. Every portal buffer that
+// pipewiresrc hands downstream without copying stays out of the compositor's
+// small pool until the pipeline drops it, and a keepalive keeps the last one
+// on top of that. A starved pool makes some compositors deliver buffers whose
+// contents are an earlier frame, which receivers show as old pictures (an
+// earlier slide) flashing between current ones. So:
+//   - alwaysCopy copies each frame out and returns the portal buffer at once;
+//     plans that map frames to the CPU anyway lose nothing by it.
+//   - keepalive repeats the last frame while the desktop is idle.
+func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int, alwaysCopy, keepalive bool) gstStage {
 	stage := gstStage{
 		"pipewiresrc",
 		fmt.Sprintf("fd=%d", fd),
 		fmt.Sprintf("path=%d", nodeID),
 		"do-timestamp=true",
-		fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)),
+	}
+	if keepalive {
+		stage = append(stage, fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps)))
 	}
 	if alwaysCopy {
-		// Retaining elements downstream must never hold every buffer in the
-		// portal's small pool. Native import paths establish their own ownership
-		// boundary instead, because pipewiresrc cannot copy every DMA-BUF.
+		// Native import paths cannot use this: pipewiresrc cannot copy every
+		// DMA-BUF, so they establish their own ownership boundary instead.
 		stage = append(stage, "always-copy=true")
 	}
 	return stage
@@ -1033,7 +1083,7 @@ func appendGstVideoEncoding(args []string, encoder encoderResult, timestampedOut
 // keeps conversion, scaling, and encoding in VA memory. PipeWire keepalives
 // supply idle frames; videorate limits them to the requested output rate.
 func buildVAWaylandVideoPipeline(fd int, nodeID uint32, fps int, encoder encoderResult, maxWidth, maxHeight int, timestampedOutput bool) []string {
-	source := pipeWireVideoSourceStage(fd, nodeID, fps, false)
+	source := pipeWireVideoSourceStage(fd, nodeID, fps, false, true)
 	args := append([]string{"--quiet"}, source...)
 	// Desktop pixels are square. Without this constraint, the VA transform can
 	// negotiate the minimum of its PAR range and fail to calculate borders.
@@ -1079,6 +1129,13 @@ func vaPostprocSystemFormat(encoderFormat string) (string, bool) {
 func waylandCapturePlans(encoder encoderResult, hasElement func(string) bool) []waylandCapturePlan {
 	plans := make([]waylandCapturePlan, 0, 2)
 	if canBuildVAWaylandVideoPipeline(encoder, hasElement) {
+		// Prefer a fresh, copied frame over native import: the native plan
+		// resends a held portal buffer on an idle desktop, which some
+		// compositors answer with stale pictures. vah264enc also accepts
+		// plain NV12, so the plain-raw plan keeps the selected encoder.
+		if _, ok := vaPostprocSystemFormat(encoder.rawFormat); ok {
+			plans = append(plans, waylandCapturePlan{encoder: encoder, mode: waylandPipelineVAPostprocPlainRaw})
+		}
 		plans = append(plans, waylandCapturePlan{encoder: encoder, mode: waylandPipelineVAMemory})
 	} else if canBuildVAPostprocPlainRawWaylandVideoPipeline(encoder, hasElement) {
 		// Scale while the frame is still handled by the VA postprocessor, then
@@ -1121,7 +1178,11 @@ func systemMemoryStagingFormat(target string) string {
 // deliberately different raw layouts make the second videoconvert allocate a
 // fresh buffer even when the portal already supplies the encoder's format.
 func buildSystemWaylandVideoPipeline(fd int, nodeID uint32, fps int, encoder encoderResult, maxWidth, maxHeight int, timestampedOutput bool) []string {
-	args := append([]string{"--quiet"}, pipeWireVideoSourceStage(fd, nodeID, fps, false)...)
+	// This plan maps every frame to the CPU anyway, so copying it out of the
+	// portal buffer costs nothing and keeps the compositor's pool full. The
+	// keepalive then repeats pipewiresrc's own copy, not a portal buffer.
+	source := pipeWireVideoSourceStage(fd, nodeID, fps, pipeWireSupportsAlwaysCopy(), true)
+	args := append([]string{"--quiet"}, source...)
 	// Desktop pixels are square. PipeWire otherwise exposes a broad PAR range,
 	// whose minimum makes videoscale calculate incorrect borders for tall regions.
 	args = appendGstStage(args, gstStage{"video/x-raw(ANY),pixel-aspect-ratio=1/1"})
@@ -1150,7 +1211,9 @@ func buildSystemWaylandVideoPipeline(fd int, nodeID uint32, fps int, encoder enc
 // may expose that result as ordinary memory or a CPU-mappable VA allocation;
 // either way, downstream never retains the portal-owned source buffer.
 func buildVAPostprocPlainRawWaylandVideoPipeline(fd int, nodeID uint32, fps int, encoder encoderResult, maxWidth, maxHeight int, timestampedOutput bool) []string {
-	args := append([]string{"--quiet"}, pipeWireVideoSourceStage(fd, nodeID, fps, false)...)
+	// Zero-copy import: vapostproc copies each portal frame into a fresh
+	// surface at once, so only the keepalive's last buffer stays held.
+	args := append([]string{"--quiet"}, pipeWireVideoSourceStage(fd, nodeID, fps, false, true)...)
 	args = appendGstStage(args, gstStage{"video/x-raw(ANY),pixel-aspect-ratio=1/1"})
 	args = appendGstStage(args, gstStage{"vapostproc", "disable-passthrough=true", "add-borders=true"})
 	postprocFormat, ok := vaPostprocSystemFormat(encoder.rawFormat)

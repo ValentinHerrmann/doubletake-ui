@@ -413,28 +413,57 @@ func TestFrameIntervalMillis(t *testing.T) {
 }
 
 func TestPipeWireVideoSourceBufferPoolPolicy(t *testing.T) {
-	base := gstStage{
-		"pipewiresrc",
-		"fd=3",
-		"path=42",
-		"do-timestamp=true",
-		"keepalive-time=34",
-	}
+	base := gstStage{"pipewiresrc", "fd=3", "path=42", "do-timestamp=true"}
+	with := func(extra ...string) gstStage { return append(append(gstStage(nil), base...), extra...) }
 	for _, test := range []struct {
 		name       string
 		alwaysCopy bool
+		keepalive  bool
 		want       gstStage
 	}{
-		{name: "native import", want: base},
-		{name: "retaining system path", alwaysCopy: true, want: append(append(gstStage(nil), base...), "always-copy=true")},
+		{name: "native import with keepalive", keepalive: true, want: with("keepalive-time=34")},
+		{name: "native import with downstream cadence", want: base},
+		{name: "copied system path", alwaysCopy: true, want: with("always-copy=true")},
+		{name: "copied with keepalive", alwaysCopy: true, keepalive: true, want: with("keepalive-time=34", "always-copy=true")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := pipeWireVideoSourceStage(3, 42, 30, test.alwaysCopy)
+			got := pipeWireVideoSourceStage(3, 42, 30, test.alwaysCopy, test.keepalive)
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("PipeWire source stage = %v, want %v", got, test.want)
 			}
 		})
 	}
+}
+
+func TestPipeWireAlwaysCopyProbeCachesOnlySuccess(t *testing.T) {
+	calls := 0
+	var next func() ([]byte, error)
+	probe := &pipeWireAlwaysCopyProbe{inspect: func(ctx context.Context) ([]byte, error) {
+		calls++
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("probe ran without a timeout")
+		}
+		return next()
+	}}
+	next = func() ([]byte, error) { return nil, errors.New("registry rebuild") }
+	if probe.get() {
+		t.Fatal("failed probe reported always-copy support")
+	}
+	next = func() ([]byte, error) { return []byte("  always-copy : Always copy the buffer"), nil }
+	if !probe.get() || !probe.get() {
+		t.Fatal("successful probe did not report always-copy support")
+	}
+	if calls != 2 {
+		t.Fatalf("gst-inspect ran %d times, want 2 (failure retried, success cached)", calls)
+	}
+}
+
+// stubPipeWireAlwaysCopy pins whether pipewiresrc reports always-copy.
+func stubPipeWireAlwaysCopy(t *testing.T, supported bool) {
+	t.Helper()
+	previous := pipeWireSupportsAlwaysCopy
+	pipeWireSupportsAlwaysCopy = func() bool { return supported }
+	t.Cleanup(func() { pipeWireSupportsAlwaysCopy = previous })
 }
 
 func TestPortalStreamDimensions(t *testing.T) {
@@ -961,16 +990,17 @@ func TestVAWaylandPipelineSelection(t *testing.T) {
 }
 
 func TestSystemWaylandPipelineDetachesBeforeRetention(t *testing.T) {
+	stubPipeWireAlwaysCopy(t, true)
 	encoder := encoderResult{parts: gstStage{"openh264enc"}, rawFormat: "I420", codec: VideoCodecH264}
 	pipeline := buildSystemWaylandVideoPipeline(3, 42, 30, encoder, 1920, 1080, true)
 	joined := strings.Join(pipeline, " ")
-	for _, forbidden := range []string{"always-copy", "vapostproc", "memory:VAMemory"} {
+	for _, forbidden := range []string{"vapostproc", "memory:VAMemory"} {
 		if strings.Contains(joined, forbidden) {
 			t.Errorf("system-memory Wayland pipeline contains %q: %s", forbidden, joined)
 		}
 	}
 	wantOrder := []string{
-		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=34",
+		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=34", "always-copy=true",
 		"!", "video/x-raw(ANY),pixel-aspect-ratio=1/1",
 		"!", "videoconvert", "!", "video/x-raw,format=NV12",
 		"!", "videoscale", "add-borders=true", "!", "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1",
@@ -982,6 +1012,23 @@ func TestSystemWaylandPipelineDetachesBeforeRetention(t *testing.T) {
 	}
 	if !containsPipelineSequence(pipeline, wantOrder) {
 		t.Fatalf("system conversion must preserve square pixels and own the frame before scaling, live cadence, queuing, and encoding:\n%s", joined)
+	}
+}
+
+// A portal buffer held by pipewiresrc is missing from the compositor's pool.
+// The system plan copies every frame anyway, so it must hand each buffer back
+// at once; older PipeWire without always-copy keeps the previous arguments.
+func TestSystemWaylandPipelineReturnsPortalBuffers(t *testing.T) {
+	encoder := encoderResult{parts: gstStage{"openh264enc"}, rawFormat: "I420", codec: VideoCodecH264}
+	for _, supported := range []bool{true, false} {
+		stubPipeWireAlwaysCopy(t, supported)
+		joined := strings.Join(buildSystemWaylandVideoPipeline(3, 42, 30, encoder, 1920, 1080, true), " ")
+		if got := strings.Contains(joined, "always-copy=true"); got != supported {
+			t.Errorf("always-copy supported=%v: pipeline has always-copy=%v: %s", supported, got, joined)
+		}
+		if !strings.Contains(joined, "keepalive-time=34") {
+			t.Errorf("system pipeline must keep idle keepalives: %s", joined)
+		}
 	}
 }
 
@@ -1540,7 +1587,7 @@ func TestWaylandCapturePlansRetainSelectedEncoderBackend(t *testing.T) {
 		wantModes    []waylandPipelineMode
 	}{
 		{method: "auto", wantElements: []string{"vulkanh264enc", "vulkanh264enc"}, wantModes: []waylandPipelineMode{waylandPipelineVAPostprocPlainRaw, waylandPipelineSystemMemory}},
-		{method: "vaapi", wantElements: []string{"vah264enc", "vah264enc"}, wantModes: []waylandPipelineMode{waylandPipelineVAMemory, waylandPipelineSystemMemory}},
+		{method: "vaapi", wantElements: []string{"vah264enc", "vah264enc", "vah264enc"}, wantModes: []waylandPipelineMode{waylandPipelineVAPostprocPlainRaw, waylandPipelineVAMemory, waylandPipelineSystemMemory}},
 		{method: "none", wantElements: []string{"x264enc", "x264enc"}, wantModes: []waylandPipelineMode{waylandPipelineVAPostprocPlainRaw, waylandPipelineSystemMemory}},
 		{method: "openh264", wantElements: []string{"openh264enc", "openh264enc"}, wantModes: []waylandPipelineMode{waylandPipelineVAPostprocPlainRaw, waylandPipelineSystemMemory}},
 	} {
