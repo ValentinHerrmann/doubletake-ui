@@ -501,11 +501,13 @@ func (d *Daemon) Shutdown() {
 }
 
 // backgroundDiscover continuously browses mDNS for AirPlay devices.
-// Each scan runs for 5 seconds. Devices not seen for >30 seconds are removed.
+// Each scan runs for 5 seconds. Devices not seen for >90 seconds are removed:
+// a Miracast search takes the Wi-Fi radio off its channel for 20 seconds and
+// mDNS replies sent meanwhile are lost, so a short TTL drops live receivers.
 func (d *Daemon) backgroundDiscover(ctx context.Context) {
 	const (
 		scanDuration = 5 * time.Second
-		deviceTTL    = 30 * time.Second
+		deviceTTL    = 90 * time.Second
 	)
 	log.Printf("[daemon] starting continuous mDNS discovery")
 	for {
