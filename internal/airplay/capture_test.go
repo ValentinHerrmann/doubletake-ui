@@ -413,28 +413,34 @@ func TestFrameIntervalMillis(t *testing.T) {
 }
 
 func TestPipeWireVideoSourceBufferPoolPolicy(t *testing.T) {
-	base := gstStage{
-		"pipewiresrc",
-		"fd=3",
-		"path=42",
-		"do-timestamp=true",
-		"keepalive-time=34",
-	}
+	base := gstStage{"pipewiresrc", "fd=3", "path=42", "do-timestamp=true"}
+	with := func(extra ...string) gstStage { return append(append(gstStage(nil), base...), extra...) }
 	for _, test := range []struct {
 		name       string
 		alwaysCopy bool
+		keepalive  bool
 		want       gstStage
 	}{
-		{name: "native import", want: base},
-		{name: "retaining system path", alwaysCopy: true, want: append(append(gstStage(nil), base...), "always-copy=true")},
+		{name: "native import with keepalive", keepalive: true, want: with("keepalive-time=34")},
+		{name: "native import with downstream cadence", want: base},
+		{name: "copied system path", alwaysCopy: true, want: with("always-copy=true")},
+		{name: "copied with keepalive", alwaysCopy: true, keepalive: true, want: with("keepalive-time=34", "always-copy=true")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := pipeWireVideoSourceStage(3, 42, 30, test.alwaysCopy)
+			got := pipeWireVideoSourceStage(3, 42, 30, test.alwaysCopy, test.keepalive)
 			if !reflect.DeepEqual(got, test.want) {
 				t.Fatalf("PipeWire source stage = %v, want %v", got, test.want)
 			}
 		})
 	}
+}
+
+// stubPipeWireAlwaysCopy pins whether pipewiresrc reports always-copy.
+func stubPipeWireAlwaysCopy(t *testing.T, supported bool) {
+	t.Helper()
+	previous := pipeWireSupportsAlwaysCopy
+	pipeWireSupportsAlwaysCopy = func() bool { return supported }
+	t.Cleanup(func() { pipeWireSupportsAlwaysCopy = previous })
 }
 
 func TestPortalStreamDimensions(t *testing.T) {
@@ -961,16 +967,17 @@ func TestVAWaylandPipelineSelection(t *testing.T) {
 }
 
 func TestSystemWaylandPipelineDetachesBeforeRetention(t *testing.T) {
+	stubPipeWireAlwaysCopy(t, true)
 	encoder := encoderResult{parts: gstStage{"openh264enc"}, rawFormat: "I420", codec: VideoCodecH264}
 	pipeline := buildSystemWaylandVideoPipeline(3, 42, 30, encoder, 1920, 1080, true)
 	joined := strings.Join(pipeline, " ")
-	for _, forbidden := range []string{"always-copy", "vapostproc", "memory:VAMemory"} {
+	for _, forbidden := range []string{"keepalive-time", "vapostproc", "memory:VAMemory"} {
 		if strings.Contains(joined, forbidden) {
 			t.Errorf("system-memory Wayland pipeline contains %q: %s", forbidden, joined)
 		}
 	}
 	wantOrder := []string{
-		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=34",
+		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "always-copy=true",
 		"!", "video/x-raw(ANY),pixel-aspect-ratio=1/1",
 		"!", "videoconvert", "!", "video/x-raw,format=NV12",
 		"!", "videoscale", "add-borders=true", "!", "video/x-raw,width=1920,height=1080,pixel-aspect-ratio=1/1",
@@ -985,17 +992,34 @@ func TestSystemWaylandPipelineDetachesBeforeRetention(t *testing.T) {
 	}
 }
 
+// A portal buffer held by pipewiresrc is missing from the compositor's pool.
+// The system plan copies every frame anyway, so it must hand each buffer back
+// at once; older PipeWire without always-copy keeps the previous arguments.
+func TestSystemWaylandPipelineReturnsPortalBuffers(t *testing.T) {
+	encoder := encoderResult{parts: gstStage{"openh264enc"}, rawFormat: "I420", codec: VideoCodecH264}
+	for _, supported := range []bool{true, false} {
+		stubPipeWireAlwaysCopy(t, supported)
+		joined := strings.Join(buildSystemWaylandVideoPipeline(3, 42, 30, encoder, 1920, 1080, true), " ")
+		if got := strings.Contains(joined, "always-copy=true"); got != supported {
+			t.Errorf("always-copy supported=%v: pipeline has always-copy=%v: %s", supported, got, joined)
+		}
+		if strings.Contains(joined, "keepalive-time") {
+			t.Errorf("system pipeline must leave idle cadence to compositor, not a keepalive: %s", joined)
+		}
+	}
+}
+
 func TestVAPostprocPlainRawWaylandPipelineScalesBeforeRetention(t *testing.T) {
 	encoder := encoderResult{parts: gstStage{"nvh265enc"}, rawFormat: "P010_10LE", codec: VideoCodecHEVC}
 	pipeline := buildVAPostprocPlainRawWaylandVideoPipeline(3, 42, 30, encoder, 1920, 1080, true)
 	joined := strings.Join(pipeline, " ")
-	for _, forbidden := range []string{"always-copy", "memory:VAMemory", "videoconvert", "videoscale", "width=1536", "height=960"} {
+	for _, forbidden := range []string{"always-copy", "keepalive-time", "memory:VAMemory", "videoconvert", "videoscale", "width=1536", "height=960"} {
 		if strings.Contains(joined, forbidden) {
 			t.Errorf("VA-to-system Wayland pipeline contains %q: %s", forbidden, joined)
 		}
 	}
 	wantOrder := []string{
-		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true", "keepalive-time=34",
+		"pipewiresrc", "fd=3", "path=42", "do-timestamp=true",
 		"!", "video/x-raw(ANY),pixel-aspect-ratio=1/1",
 		"!", "vapostproc", "disable-passthrough=true", "add-borders=true",
 		"!", "video/x-raw,format=P010_10LE,width=1920,height=1080,pixel-aspect-ratio=1/1",
@@ -1151,8 +1175,8 @@ func TestWaylandPipelineIgnoresPortalCoordinateSize(t *testing.T) {
 	if strings.Count(joined, "width=1920,height=1080") != 2 {
 		t.Fatalf("pipeline must fit and pin the live output to the receiver canvas: %s", joined)
 	}
-	if !strings.Contains(joined, "compositor force-live=true") || !strings.Contains(joined, "keepalive-time=34") {
-		t.Fatalf("idle cadence must retain the copied receiver-sized frame: %s", joined)
+	if !strings.Contains(joined, "compositor force-live=true") || strings.Contains(joined, "keepalive-time") {
+		t.Fatalf("idle cadence must come from compositor, not a portal-buffer keepalive: %s", joined)
 	}
 }
 
@@ -1573,9 +1597,12 @@ func TestWaylandPlansUsePortableOutputRateControl(t *testing.T) {
 			if strings.Contains(pipeline, "max-framerate") {
 				t.Fatalf("pipeline used a source caps field rejected by some portals: %s", pipeline)
 			}
-			if !strings.Contains(pipeline, fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps))) ||
+			// Only the native VA plan lacks a compositor cadence stage and
+			// needs pipewiresrc keepalives for an idle desktop.
+			wantKeepalive := mode == waylandPipelineVAMemory
+			if strings.Contains(pipeline, fmt.Sprintf("keepalive-time=%d", frameIntervalMillis(fps))) != wantKeepalive ||
 				!strings.Contains(pipeline, fmt.Sprintf("framerate=%d/1", fps)) {
-				t.Fatalf("pipeline must retain source keepalives and paced output: %s", pipeline)
+				t.Fatalf("pipeline must pace output, with keepalives only on the native VA plan: %s", pipeline)
 			}
 		}
 	}
