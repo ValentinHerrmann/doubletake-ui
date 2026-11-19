@@ -890,13 +890,45 @@ func frameIntervalMillis(fps int) int {
 	return 1 + 999/fps
 }
 
+const pipeWirePropertyProbeTimeout = 5 * time.Second
+
+// pipeWireAlwaysCopyProbe remembers a successful answer only, so a failed or
+// timed-out gst-inspect (for example during a registry rebuild) is retried
+// on the next capture instead of disabling always-copy for good.
+type pipeWireAlwaysCopyProbe struct {
+	mu        sync.Mutex
+	known     bool
+	supported bool
+	inspect   func(ctx context.Context) ([]byte, error)
+}
+
+func (p *pipeWireAlwaysCopyProbe) get() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.known {
+		return p.supported
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pipeWirePropertyProbeTimeout)
+	defer cancel()
+	out, err := p.inspect(ctx)
+	if err != nil {
+		return false
+	}
+	p.known = true
+	p.supported = bytes.Contains(out, []byte("always-copy"))
+	return p.supported
+}
+
+var defaultPipeWireAlwaysCopyProbe = &pipeWireAlwaysCopyProbe{
+	inspect: func(ctx context.Context) ([]byte, error) {
+		return exec.CommandContext(ctx, "gst-inspect-1.0", "pipewiresrc").Output()
+	},
+}
+
 // pipeWireSupportsAlwaysCopy reports whether the installed pipewiresrc has the
 // always-copy property (PipeWire 0.3.57 and newer). It is a variable so tests
 // can pin the answer without a GStreamer installation.
-var pipeWireSupportsAlwaysCopy = sync.OnceValue(func() bool {
-	out, err := exec.Command("gst-inspect-1.0", "pipewiresrc").Output()
-	return err == nil && bytes.Contains(out, []byte("always-copy"))
-})
+var pipeWireSupportsAlwaysCopy = defaultPipeWireAlwaysCopyProbe.get
 
 // pipeWireVideoSourceStage builds the portal source. Every portal buffer that
 // pipewiresrc hands downstream without copying stays out of the compositor's
@@ -906,8 +938,7 @@ var pipeWireSupportsAlwaysCopy = sync.OnceValue(func() bool {
 // earlier slide) flashing between current ones. So:
 //   - alwaysCopy copies each frame out and returns the portal buffer at once;
 //     plans that map frames to the CPU anyway lose nothing by it.
-//   - keepalive repeats the last frame while the desktop is idle. Plans with a
-//     downstream live cadence stage do not need it.
+//   - keepalive repeats the last frame while the desktop is idle.
 func pipeWireVideoSourceStage(fd int, nodeID uint32, fps int, alwaysCopy, keepalive bool) gstStage {
 	stage := gstStage{
 		"pipewiresrc",
@@ -1098,6 +1129,13 @@ func vaPostprocSystemFormat(encoderFormat string) (string, bool) {
 func waylandCapturePlans(encoder encoderResult, hasElement func(string) bool) []waylandCapturePlan {
 	plans := make([]waylandCapturePlan, 0, 2)
 	if canBuildVAWaylandVideoPipeline(encoder, hasElement) {
+		// Prefer a fresh, copied frame over native import: the native plan
+		// resends a held portal buffer on an idle desktop, which some
+		// compositors answer with stale pictures. vah264enc also accepts
+		// plain NV12, so the plain-raw plan keeps the selected encoder.
+		if _, ok := vaPostprocSystemFormat(encoder.rawFormat); ok {
+			plans = append(plans, waylandCapturePlan{encoder: encoder, mode: waylandPipelineVAPostprocPlainRaw})
+		}
 		plans = append(plans, waylandCapturePlan{encoder: encoder, mode: waylandPipelineVAMemory})
 	} else if canBuildVAPostprocPlainRawWaylandVideoPipeline(encoder, hasElement) {
 		// Scale while the frame is still handled by the VA postprocessor, then
@@ -1142,9 +1180,8 @@ func systemMemoryStagingFormat(target string) string {
 func buildSystemWaylandVideoPipeline(fd int, nodeID uint32, fps int, encoder encoderResult, maxWidth, maxHeight int, timestampedOutput bool) []string {
 	// This plan maps every frame to the CPU anyway, so copying it out of the
 	// portal buffer costs nothing and keeps the compositor's pool full. The
-	// compositor stage below supplies idle cadence, so no keepalive pins a
-	// portal buffer either.
-	source := pipeWireVideoSourceStage(fd, nodeID, fps, pipeWireSupportsAlwaysCopy(), false)
+	// keepalive then repeats pipewiresrc's own copy, not a portal buffer.
+	source := pipeWireVideoSourceStage(fd, nodeID, fps, pipeWireSupportsAlwaysCopy(), true)
 	args := append([]string{"--quiet"}, source...)
 	// Desktop pixels are square. PipeWire otherwise exposes a broad PAR range,
 	// whose minimum makes videoscale calculate incorrect borders for tall regions.
@@ -1174,9 +1211,9 @@ func buildSystemWaylandVideoPipeline(fd int, nodeID uint32, fps int, encoder enc
 // may expose that result as ordinary memory or a CPU-mappable VA allocation;
 // either way, downstream never retains the portal-owned source buffer.
 func buildVAPostprocPlainRawWaylandVideoPipeline(fd int, nodeID uint32, fps int, encoder encoderResult, maxWidth, maxHeight int, timestampedOutput bool) []string {
-	// Zero-copy import, but no keepalive: the compositor stage below supplies
-	// idle cadence, so a keepalive would only keep a portal buffer out of the pool.
-	args := append([]string{"--quiet"}, pipeWireVideoSourceStage(fd, nodeID, fps, false, false)...)
+	// Zero-copy import: vapostproc copies each portal frame into a fresh
+	// surface at once, so only the keepalive's last buffer stays held.
+	args := append([]string{"--quiet"}, pipeWireVideoSourceStage(fd, nodeID, fps, false, true)...)
 	args = appendGstStage(args, gstStage{"video/x-raw(ANY),pixel-aspect-ratio=1/1"})
 	args = appendGstStage(args, gstStage{"vapostproc", "disable-passthrough=true", "add-borders=true"})
 	postprocFormat, ok := vaPostprocSystemFormat(encoder.rawFormat)
@@ -1377,9 +1414,9 @@ func startWaylandCaptureAttempt(ctx context.Context, cfg CaptureConfig, plan way
 	}
 
 	// Capture from the negotiated PipeWire pixel stream. System-memory plans
-	// copy and fit a frame before a live cadence stage repeats it, so they need
-	// no pipewiresrc keepalive. The native VA plan relies on keepalives because
-	// compositor cannot consume VAMemory without an extra download and upload.
+	// copy and fit a frame before a live cadence stage can retain it. The native
+	// VA plan relies on pipewiresrc keepalives because compositor cannot consume
+	// VAMemory without an extra download and upload.
 	const pwFdNum = 3
 	gstArgs := buildWaylandVideoPipelineForPlan(
 		pwFdNum, nodeID, fps, plan, cfg.MaxWidth, cfg.MaxHeight, timestampedOutput)
