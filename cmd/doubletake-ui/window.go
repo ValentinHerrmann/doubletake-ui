@@ -21,9 +21,9 @@ const pollMillis = 1000
 const quitDisconnectWait = 5 * time.Second
 
 // miracastSearchEvery spaces Miracast searches while the window is open: the
-// daemon searches for 20 s, then Wi-Fi gets 10 s undisturbed. A search moves
+// daemon searches for 20 s, then Wi-Fi gets 40 s undisturbed. A search moves
 // the radio off its channel, so none runs while hidden in the tray or casting.
-const miracastSearchEvery = 30 * time.Second
+const miracastSearchEvery = 60 * time.Second
 
 // window shows the daemon state and turns clicks into daemon requests. Its
 // fields are touched only on the GTK main loop; daemon calls run in
