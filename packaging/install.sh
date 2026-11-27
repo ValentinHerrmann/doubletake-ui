@@ -25,6 +25,12 @@ if [ "${1:-}" = "--uninstall" ]; then
 	exit 0
 fi
 
+# A running app or daemon keeps using its old binary, and the new UI would talk
+# to the old daemon, so stop both before replacing them.
+stopped=
+if pkill -x doubletake-ui 2>/dev/null; then stopped=1; fi
+if pkill -x doubletake 2>/dev/null; then stopped=1; fi
+
 install -d "$BINDIR" "$APPDIR" "$ICONDIR"
 # doubletake-ui starts the doubletake daemon next to it.
 install -m 755 "$HERE/bin/doubletake" "$HERE/bin/doubletake-ui" "$BINDIR/"
@@ -35,6 +41,7 @@ install -m 644 "$HERE/share/icons/hicolor/scalable/apps/doubletake.svg" "$ICONDI
 refresh_caches
 
 echo "Doubletake installed to $PREFIX. Start it from your app menu or run $BINDIR/doubletake-ui."
+if [ -n "$stopped" ]; then echo "The running Doubletake was stopped; start it again to use this version."; fi
 
 if ! command -v gst-launch-1.0 >/dev/null; then
 	echo "warning: GStreamer not found; install GStreamer 1.0 with the base/good/bad/ugly/libav plugins (see README)." >&2
