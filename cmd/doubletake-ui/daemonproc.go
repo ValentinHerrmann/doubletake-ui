@@ -15,7 +15,12 @@ import (
 	"doubletake/internal/daemon/daemonclient"
 )
 
-const daemonStartTimeout = 5 * time.Second
+const (
+	daemonStartTimeout = 5 * time.Second
+
+	// A log above this size is moved to daemon.log.1 when a daemon starts.
+	daemonLogMaxBytes = 5 << 20
+)
 
 var waylandSock = regexp.MustCompile(`^wayland-\d+$`)
 
@@ -37,7 +42,17 @@ func ensureDaemon(client *daemonclient.Client, binary string, noAudio bool) erro
 	cmd := exec.Command(name, args...)
 	cmd.Env = sessionEnv(os.Environ())
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
+
+	// Without a log file the daemon's output is discarded, as before.
+	logFile, logErr := openDaemonLog(daemonLogPath())
+	if logErr == nil {
+		cmd.Stdout, cmd.Stderr = logFile, logFile
+	}
+	err := cmd.Start()
+	if logFile != nil {
+		_ = logFile.Close()
+	}
+	if err != nil {
 		return fmt.Errorf("start doubletake daemon: %w", err)
 	}
 	exited := make(chan error, 1)
@@ -57,6 +72,35 @@ func ensureDaemon(client *daemonclient.Client, binary string, noAudio bool) erro
 			return errors.New("doubletake daemon did not start in time")
 		}
 	}
+}
+
+// daemonLogPath is where the daemon started by the app writes its log:
+// $XDG_STATE_HOME/doubletake/daemon.log, or ~/.local/state/doubletake/daemon.log.
+func daemonLogPath() string {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(dir, "doubletake", "daemon.log")
+}
+
+// openDaemonLog opens path for appending, first moving a log larger than
+// daemonLogMaxBytes to path.1 so the log keeps at most two generations.
+func openDaemonLog(path string) (*os.File, error) {
+	if path == "" {
+		return nil, errors.New("no log directory")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	if info, err := os.Stat(path); err == nil && info.Size() > daemonLogMaxBytes {
+		_ = os.Rename(path, path+".1")
+	}
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 }
 
 // findDoubletake prefers a doubletake built alongside this binary, since only

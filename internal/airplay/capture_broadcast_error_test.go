@@ -23,7 +23,7 @@ func TestBroadcastTerminalReadsRaceWithCleanup(t *testing.T) {
 		want := io.EOF
 		if overflow {
 			want = errBroadcastSinkBacklog
-			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{1, 2}}); !errors.Is(err, want) {
+			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{1, 2}}, false); !errors.Is(err, want) {
 				t.Fatal(err)
 			}
 		}
@@ -91,22 +91,17 @@ func TestBroadcastBacklogSurvivesCaptureAndStreamFrames(t *testing.T) {
 }
 
 func TestBroadcastOverflowIsTerminalBeforeRemoval(t *testing.T) {
-	for _, mode := range []string{"bytes", "chunks", "frame-bytes", "frame-chunks", "duration"} {
+	for _, mode := range []string{"bytes", "chunks"} {
 		t.Run(mode, func(t *testing.T) {
 			sink := newBroadcastSink(nil)
 			defer sink.Close()
 			switch mode {
-			case "bytes", "frame-bytes":
+			case "bytes":
 				sink.maxQueuedBytes = 1
-			case "chunks", "frame-chunks":
+			case "chunks":
 				sink.maxQueuedChunks = 1
-			case "duration":
-				sink.maxFrameQueueDuration = sink.frameDuration
 			}
 			enqueue := func() error { return sink.enqueue([]byte{1}) }
-			if strings.HasPrefix(mode, "frame-") || mode == "duration" {
-				enqueue = func() error { return sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{1}}) }
-			}
 			if err := enqueue(); err != nil {
 				t.Fatal(err)
 			}
@@ -135,5 +130,72 @@ func TestBroadcastOverflowIsTerminalBeforeRemoval(t *testing.T) {
 				t.Fatalf("enqueue after terminal overflow = %v, want closed pipe", err)
 			}
 		})
+	}
+}
+
+func TestBroadcastFrameOverflowResyncsAtKeyframe(t *testing.T) {
+	for _, mode := range []string{"frame-bytes", "frame-chunks", "duration"} {
+		t.Run(mode, func(t *testing.T) {
+			sink := newBroadcastSink(nil)
+			defer sink.Close()
+			switch mode {
+			case "frame-bytes":
+				sink.maxQueuedBytes = 1
+			case "frame-chunks":
+				sink.maxQueuedChunks = 1
+			case "duration":
+				sink.maxFrameQueueDuration = sink.frameDuration
+			}
+			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{1}}, false); err != nil {
+				t.Fatal(err)
+			}
+			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{2}}, false); err != nil {
+				t.Fatalf("overflow = %v, want resync", err)
+			}
+			assertSinkAwaitsKeyframe(t, sink)
+			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{3}}, false); err != nil {
+				t.Fatalf("frame while awaiting keyframe = %v", err)
+			}
+			assertSinkAwaitsKeyframe(t, sink)
+			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{4}}, true); err != nil {
+				t.Fatalf("keyframe = %v", err)
+			}
+			if frame, err := sink.ReadVideoAccessUnit(); err != nil || !bytes.Equal(frame.AnnexB, []byte{4}) {
+				t.Fatalf("first frame after resync = (%x, %v), want keyframe 04", frame.AnnexB, err)
+			}
+		})
+	}
+}
+
+func TestBroadcastFrameOverflowOnKeyframeEnqueuesIt(t *testing.T) {
+	sink := newBroadcastSink(nil)
+	defer sink.Close()
+	sink.maxFrameQueueDuration = sink.frameDuration
+	if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{1}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{2}}, true); err != nil {
+		t.Fatalf("overflow on keyframe = %v", err)
+	}
+	if frame, err := sink.ReadVideoAccessUnit(); err != nil || !bytes.Equal(frame.AnnexB, []byte{2}) {
+		t.Fatalf("frame after overflow = (%x, %v), want keyframe 02", frame.AnnexB, err)
+	}
+	if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{3}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if frame, err := sink.ReadVideoAccessUnit(); err != nil || !bytes.Equal(frame.AnnexB, []byte{3}) {
+		t.Fatalf("P-frame after keyframe = (%x, %v), want 03", frame.AnnexB, err)
+	}
+}
+
+// assertSinkAwaitsKeyframe checks that an overflowed shared sink stayed open,
+// holds no stale access units and waits for the next keyframe.
+func assertSinkAwaitsKeyframe(t *testing.T, sink *BroadcastSink) {
+	t.Helper()
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if sink.closed || !sink.awaitKeyframe || len(sink.frameQueue) != 0 || sink.queuedBytes != 0 || sink.queuedFrameDuration != 0 {
+		t.Fatalf("sink closed=%v awaitKeyframe=%v queued=%d bytes=%d duration=%v, want open, awaiting keyframe, empty",
+			sink.closed, sink.awaitKeyframe, len(sink.frameQueue), sink.queuedBytes, sink.queuedFrameDuration)
 	}
 }

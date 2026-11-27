@@ -96,6 +96,11 @@ interface as `doubletake-ctl` and the [Plasma widget](plasmoid/). If no daemon
 is running, it starts `doubletake -daemonize` from the binary next to itself
 (or `doubletake-src`, then `doubletake` on `PATH`; override with
 `-doubletake <path>`). `-no-audio` applies only to a daemon the app starts.
+A daemon the app starts writes its log to
+`$XDG_STATE_HOME/doubletake/daemon.log` (normally
+`~/.local/state/doubletake/daemon.log`); the previous log is kept as
+`daemon.log.1` once it grows past 5 MiB. If a cast ends on its own, the app
+shows the reason, and the log has the details.
 
 Closing the window does not stop a cast: the daemon keeps running. Stop it
 with **Stop casting** or `doubletake-ctl disconnect`. Only one window runs per
@@ -424,6 +429,23 @@ and range.
 NTP and PTP use the same presentation policy; the timing protocol only changes
 how timestamps are represented. In automatic mode, an ordinary connection uses
 a 75 ms video lead and an 85 ms screen-audio lead.
+
+### Window on another workspace freezes (GNOME)
+
+On GNOME, a shared window stops updating while it is on a workspace you are
+not looking at. It updates again when you switch to that workspace or open the
+Activities overview. GNOME (mutter) suspends windows that are not visible,
+even while they are being shared, so the app showing that window stops
+drawing. Doubletake cannot change this. Keep the shared window on the visible
+workspace or on another monitor, or share a screen instead.
+
+### Slow or unstable network
+
+If the network to the receiver stalls, doubletake drops the video it could not
+send and continues at the next keyframe, at most two seconds later. The
+receiver shows a short freeze instead of losing the connection. The daemon log
+contains a `receiver fell ... behind` line for each such skip; frequent skips
+mean the link cannot carry the video bitrate (see `-bitrate`).
 
 ## Tested devices
 

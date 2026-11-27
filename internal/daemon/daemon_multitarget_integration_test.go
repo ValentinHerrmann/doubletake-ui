@@ -504,3 +504,73 @@ func waitForDaemonSocketStatus(t *testing.T, socketPath string, timeout time.Dur
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+func TestDaemonReportsReceiverLostMidStream(t *testing.T) {
+	if _, err := exec.LookPath("gst-launch-1.0"); err != nil {
+		t.Skip("gst-launch-1.0 is required for the headless capture integration test")
+	}
+	if err := exec.Command("gst-inspect-1.0", "openh264enc").Run(); err != nil {
+		t.Skip("GStreamer openh264enc is required for the headless capture integration test")
+	}
+
+	server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
+		ListenAddress: "127.0.0.1:0",
+		Profile:       airplay.ReceiverProfileRoku,
+		Auth:          airplay.ReceiverAuthNone,
+		Name:          "Lost TV",
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("start receiver: %v", err)
+	}
+	receiverDone := make(chan error, 1)
+	go func() { receiverDone <- server.Serve(context.Background()) }()
+	defer func() { _ = server.Close() }()
+
+	socketPath := filepath.Join(t.TempDir(), "doubletake.sock")
+	d, err := New(Config{
+		SocketPath:  socketPath,
+		CredBackend: "file",
+		CredFile:    filepath.Join(t.TempDir(), "credentials.json"),
+		FPS:         10,
+		Bitrate:     500,
+		HWAccel:     "openh264",
+		TestMode:    true,
+		NoAudio:     true,
+	})
+	if err != nil {
+		t.Fatalf("create daemon: %v", err)
+	}
+	daemonCtx, cancelDaemon := context.WithCancel(context.Background())
+	daemonDone := make(chan error, 1)
+	go func() { daemonDone <- d.Run(daemonCtx) }()
+	defer func() {
+		cancelDaemon()
+		d.Shutdown()
+		select {
+		case <-daemonDone:
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	}()
+	waitForDaemonSocket(t, socketPath)
+
+	addr := server.Addr().(*net.TCPAddr)
+	if resp := sendDaemonSocketRequest(t, socketPath, Request{Cmd: "connect", Target: addr.IP.String(), Port: addr.Port}); !resp.OK {
+		t.Fatalf("connect: %+v", resp)
+	}
+	waitForDaemonSocketStatus(t, socketPath, 15*time.Second, func(resp Response) bool {
+		return len(resp.Streams) == 1 && resp.Streams[0].State == StateStreaming
+	})
+
+	// The receiver going away mid-stream must end the stream with a reason.
+	if err := server.Close(); err != nil {
+		t.Fatalf("close receiver: %v", err)
+	}
+	status := waitForDaemonSocketStatus(t, socketPath, 10*time.Second, func(resp Response) bool {
+		return len(resp.Streams) == 0 && resp.Error != ""
+	})
+	if want := "Lost TV: connection lost: "; len(status.Error) < len(want) || status.Error[:len(want)] != want {
+		t.Fatalf("status error = %q, want prefix %q", status.Error, want)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"sync"
 	"time"
 )
@@ -22,10 +23,9 @@ const (
 
 	// Shared encoded fan-out needs room for scheduler and transport bursts: a
 	// quarter second of nominal samples, independent of the 67 ms raw-frame
-	// queue. Encoded reference pictures cannot be dropped to catch up, so a
-	// sustained backlog disconnects only that receiver instead. Byte and chunk
-	// bounds still cap memory independently; single-target handoff still waits
-	// with just one pending AU.
+	// queue. A receiver which falls further behind drops its unsent backlog and
+	// resumes at the next keyframe. Byte and chunk bounds still cap memory
+	// independently; single-target handoff still waits with just one pending AU.
 	broadcastSinkFrameQueueDuration = 250 * time.Millisecond
 
 	// Source shutdown normally races with consumers draining their last few
@@ -121,6 +121,10 @@ type BroadcastSink struct {
 	backpressure          bool
 	blockedProducers      int // number waiting for queue handoff; guarded by mu
 
+	// awaitKeyframe drops live access units after a discarded backlog until
+	// the next keyframe, which references no picture the receiver missed.
+	awaitKeyframe bool
+
 	inputClosed   bool  // the source ended; drain queue, then return EOF
 	closed        bool  // removed or failed; discard queue and return terminalErr
 	terminalErr   error // immutable after closed; guarded by mu
@@ -209,7 +213,7 @@ func (bc *BroadcastCapture) sendCurrentStillLocked(s *BroadcastSink) {
 	if bc.stillUnit == nil {
 		return
 	}
-	if err := s.enqueueFrame(VideoAccessUnit{AnnexB: bc.stillUnit, PTS: bc.stillPTSLocked()}); err != nil {
+	if err := s.enqueueFrame(VideoAccessUnit{AnnexB: bc.stillUnit, PTS: bc.stillPTSLocked()}, true); err != nil {
 		bc.RemoveSink(s)
 	}
 }
@@ -324,7 +328,7 @@ func (bc *BroadcastCapture) runFrames() error {
 		frame, readErr := bc.src.ReadVideoAccessUnit()
 		if len(frame.AnnexB) > 0 {
 			bc.holdMu.Lock()
-			if bc.recordLiveFrameLocked(frame) {
+			if forward, keyframe := bc.recordLiveFrameLocked(frame); forward {
 				bc.mu.Lock()
 				sinks := make([]*BroadcastSink, 0, len(bc.sinks))
 				for _, sink := range bc.sinks {
@@ -335,7 +339,7 @@ func (bc *BroadcastCapture) runFrames() error {
 				bc.mu.Unlock()
 
 				for _, sink := range sinks {
-					if err := sink.enqueueFrame(frame); err != nil {
+					if err := sink.enqueueFrame(frame, keyframe); err != nil {
 						// enqueueFrame already published any terminal backlog error
 						// under the sink lock; removal only detaches it from fan-out.
 						bc.RemoveSink(sink)
@@ -450,12 +454,11 @@ func (s *BroadcastSink) frameQueueExceedsLimitsLocked(frame VideoAccessUnit) boo
 
 // enqueueFrame appends an immutable complete access unit without copying it.
 // The same backing bytes can safely be referenced by every receiver queue.
-// An explicitly single-destination sink waits once one AU is pending, rather
-// than accumulating encoded references which cannot safely be dropped. Shared
-// fan-out is nonblocking and detaches only the sink which exceeds Doubletake's
-// nominal-duration relay budget. Detachment does not discard individual
-// encoded references.
-func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
+// An explicitly single-destination sink waits once one AU is pending. Shared
+// fan-out is nonblocking: a sink exceeding Doubletake's nominal-duration relay
+// budget discards its unsent backlog and resumes at the next keyframe, because
+// later P-frames reference pictures it never sent.
+func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit, keyframe bool) error {
 	if len(frame.AnnexB) == 0 {
 		return nil
 	}
@@ -476,9 +479,19 @@ func (s *BroadcastSink) enqueueFrame(frame VideoAccessUnit) error {
 			s.blockedProducers--
 			continue
 		}
+		if s.awaitKeyframe {
+			if !keyframe {
+				return nil
+			}
+			s.awaitKeyframe = false
+		}
 		if s.frameQueueExceedsLimitsLocked(frame) {
-			s.abortLocked(errBroadcastSinkBacklog)
-			return errBroadcastSinkBacklog
+			log.Printf("[CAPTURE] receiver fell %v behind; dropped %d queued frames and resumes at the next keyframe", s.queuedFrameDuration, len(s.frameQueue))
+			s.discardFramesLocked()
+			if !keyframe {
+				s.awaitKeyframe = true
+				return nil
+			}
 		}
 		break
 	}
@@ -511,6 +524,17 @@ func (s *BroadcastSink) abort() {
 	s.mu.Lock()
 	s.abortLocked(io.EOF)
 	s.mu.Unlock()
+}
+
+// discardFramesLocked drops queued access units which the reader has not yet
+// taken, keeping the sink open. Must hold s.mu.
+func (s *BroadcastSink) discardFramesLocked() {
+	for i := range s.frameQueue {
+		s.queuedBytes -= len(s.frameQueue[i].AnnexB)
+		s.frameQueue[i].AnnexB = nil
+	}
+	s.frameQueue = nil
+	s.queuedFrameDuration = 0
 }
 
 // abortLocked makes queue failure and its reader-visible error atomic. A

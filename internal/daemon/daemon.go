@@ -1307,7 +1307,8 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 
 	streamErr := <-videoDone
-	if streamErr != nil && ctx.Err() == nil {
+	lost := streamErr != nil && ctx.Err() == nil
+	if lost {
 		log.Printf("[daemon] stream error for %s: %v", target, streamErr)
 	}
 
@@ -1317,6 +1318,10 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	d.mu.Lock()
 	cleanup := daemonCleanup{}
 	if d.streams[target] == entry {
+		if lost {
+			d.lastError = fmt.Sprintf("%s: connection lost: %v", info.Name, streamErr)
+			d.lastErrorTarget = target
+		}
 		cleanup = d.detachStreamLocked(target)
 	}
 	d.mu.Unlock()

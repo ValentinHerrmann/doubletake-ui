@@ -51,9 +51,10 @@ type stillJob struct {
 }
 
 // recordLiveFrameLocked tracks the stream state a still needs and reports
-// whether a live access unit may reach the sinks. Must hold bc.holdMu.
-func (bc *BroadcastCapture) recordLiveFrameLocked(frame VideoAccessUnit) bool {
-	keyframe := AccessUnitHasKeyframe(frame.AnnexB, bc.codec)
+// whether a live access unit may reach the sinks, and whether it is a
+// keyframe. Must hold bc.holdMu.
+func (bc *BroadcastCapture) recordLiveFrameLocked(frame VideoAccessUnit) (forward, keyframe bool) {
+	keyframe = AccessUnitHasKeyframe(frame.AnnexB, bc.codec)
 	bc.lastPTS = frame.PTS
 	bc.lastArrival = time.Now()
 	if keyframe {
@@ -73,14 +74,14 @@ func (bc *BroadcastCapture) recordLiveFrameLocked(frame VideoAccessUnit) bool {
 
 	switch {
 	case bc.hold != HoldNone:
-		return false
+		return false, keyframe
 	case bc.awaitKeyframe:
 		// Live P-frames reference pictures the sinks never decoded: resume only
 		// at a keyframe, and stop the still first so none follows it. A
 		// keyframe stamped too close to the last still would leave the sinks'
 		// timeline without a frame interval, so it waits for the next one.
 		if !keyframe || frame.PTS.Before(bc.lastSentPTS.Add(bc.frameDuration)) {
-			return false
+			return false, keyframe
 		}
 		bc.awaitKeyframe = false
 		bc.stillGen++
@@ -89,7 +90,7 @@ func (bc *BroadcastCapture) recordLiveFrameLocked(frame VideoAccessUnit) bool {
 	if frame.PTS.After(bc.lastSentPTS) {
 		bc.lastSentPTS = frame.PTS
 	}
-	return true
+	return true, keyframe
 }
 
 func (bc *BroadcastCapture) fps() int {
@@ -244,7 +245,7 @@ func (bc *BroadcastCapture) sendStillLocked(unit []byte) {
 	sinks := append([]*BroadcastSink(nil), bc.sinks...)
 	bc.mu.Unlock()
 	for _, sink := range sinks {
-		if err := sink.enqueueFrame(frame); err != nil {
+		if err := sink.enqueueFrame(frame, true); err != nil {
 			bc.RemoveSink(sink)
 		}
 	}

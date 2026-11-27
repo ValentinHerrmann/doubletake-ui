@@ -13,7 +13,7 @@ func TestBroadcastSinkDrainedBurstRestoresBudget(t *testing.T) {
 	defer sink.Close()
 	for burst := 0; burst < 3; burst++ {
 		for i := 0; i < 7; i++ {
-			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{byte(i)}}); err != nil {
+			if err := sink.enqueueFrame(VideoAccessUnit{AnnexB: []byte{byte(i)}}, false); err != nil {
 				t.Fatalf("burst %d frame %d: %v", burst, i, err)
 			}
 		}
